@@ -1,0 +1,27 @@
+# Output directory
+recon/
+
+# Generated reports
+*.html
+*.txt
+
+# Environment files
+.env
+.env.local
+.env.*.local
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+Thumbs.db
+.DS_Store
+
+# Build artifacts
+dist/
+build/
+out/
