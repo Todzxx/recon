@@ -1,25 +1,36 @@
 ﻿<#
 .SYNOPSIS
-    Recon Automation Tool v3.5 - Universal Web Security Scanner
+    Recon Automation Tool v4.0 - Universal Web Security Scanner
 .DESCRIPTION
-    Multi-module recon scanner with concurrency, big wordlists, WAF detection,
-    DNS enumeration, SSL analysis, tech fingerprinting, CVE scanning,
-    Wayback machine, API fuzzing, SQLi/XSS/LFI detection, JSON output
+    Multi-module recon scanner: JS extraction, CORS, CDN bypass, method fuzzing,
+    favicon hash, cloud buckets, WebSocket, JWT, recursion, retry, verbose
 .PARAMETER Target
     Target domain or URL to scan
 .PARAMETER TargetFile
     File containing list of targets (one per line)
 .PARAMETER Quick
-    Quick scan (headers, dirs, CMS, basic vulns)
+    Quick scan (headers, dirs, basic vulns)
 .PARAMETER Full
-    Full scan (all modules)
+    Full scan (all modules + ports + subdomains + advanced)
 .PARAMETER Json
     Export results as JSON
 .PARAMETER OutputDir
     Output directory for reports
+.PARAMETER WordlistFile
+    Custom wordlist file for directory scan (one per line)
+.PARAMETER Depth
+    Directory recursion depth (default: 1, max: 3)
+.PARAMETER Verbose
+    Enable verbose/debug output
+.PARAMETER Nmap
+    Use nmap for port scanning (requires nmap installed)
+.PARAMETER NmapArgs
+    Extra nmap arguments (default: "-sV -sC --min-rate=500 --max-retries=2")
 .EXAMPLE
     .\recon.ps1 -Target example.com -Quick
-    .\recon.ps1 -Target example.com -Full -Json
+    .\recon.ps1 -Target example.com -Full -Json -WordlistFile mydirs.txt -Depth 2 -Verbose
+    .\recon.ps1 -Target example.com -Full -Nmap
+    .\recon.ps1 -Target example.com -Full -Nmap -NmapArgs "-sV -sC -A --min-rate=1000"
     .\recon.ps1 -TargetFile targets.txt -Quick
 #>
 
@@ -29,10 +40,15 @@ param(
     [switch]$Quick,
     [switch]$Full,
     [switch]$Json,
-    [string]$OutputDir = "D:\TUGAS\output\recon"
+    [string]$OutputDir = "D:\TUGAS\output\recon",
+    [string]$WordlistFile = $null,
+    [int]$Depth = 1,
+    [switch]$Verbose,
+    [switch]$Nmap,
+    [string]$NmapArgs = "-sV -sC --min-rate=500 --max-retries=2"
 )
 
-$Script:VERSION = "3.5"
+$Script:VERSION = "4.0"
 
 # =====================================================================
 # EXPANDED WORDLISTS
@@ -159,7 +175,7 @@ function Write-Banner {
     RECON AUTOMATION TOOL v$($Script:VERSION)
     Universal Web Security Scanner
     $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
-    Features: Concurrent + WAF + DNS + SSL + CMS + Wayback + SQLi/XSS/LFI
+    Features: JS Extract + CORS + CDN Bypass + Method Fuzz + Favicon + Cloud + WS + JWT
     Output: HTML + JSON
 
 "@
@@ -170,6 +186,14 @@ function Log {
     param([string]$Msg, [string]$Color = "White")
     $timestamp = Get-Date -Format "HH:mm:ss"
     Write-Host "[$timestamp] $Msg" -ForegroundColor $Color
+}
+
+function Write-DebugMsg {
+    param([string]$Msg)
+    if ($Verbose) {
+        $timestamp = Get-Date -Format "HH:mm:ss"
+        Write-Host "[$timestamp] [DEBUG] $Msg" -ForegroundColor Gray
+    }
 }
 
 function Section {
@@ -193,11 +217,34 @@ function Get-Url {
 }
 
 function Invoke-WebRequestSafe {
-    param([string]$Url, [int]$TimeoutSec = 15, [string]$Method = "GET")
+    param([string]$Url, [int]$TimeoutSec = 15, [string]$Method = "GET", [string]$Body = "", [string]$ContentType = "")
+    $maxRetries = 3
+    for ($attempt = 0; $attempt -lt $maxRetries; $attempt++) {
+        try {
+            $ua = $Script:userAgents | Get-Random
+            $params = @{Uri=$Url; UserAgent=$ua; TimeoutSec=$TimeoutSec; UseBasicParsing=$true; Method=$Method; ErrorAction="Stop"}
+            if ($Body -and $ContentType) { $params["Body"] = $Body; $params["ContentType"] = $ContentType }
+            $resp = Invoke-WebRequest @params
+            return $resp
+        } catch {
+            if ($_.Exception.Response.StatusCode -eq 429 -and $attempt -lt ($maxRetries - 1)) {
+                $wait = [Math]::Pow(2, $attempt + 1)
+                Write-DebugMsg "429 rate limited, retrying in ${wait}s (attempt $($attempt+1)/$maxRetries)"
+                Start-Sleep -Seconds $wait
+            } else {
+                return $null
+            }
+        }
+    }
+    return $null
+}
+
+function Invoke-WebRequestMethod {
+    param([string]$Url, [string]$Method, [int]$TimeoutSec = 8)
     try {
         $ua = $Script:userAgents | Get-Random
         $resp = Invoke-WebRequest -Uri $Url -UserAgent $ua -TimeoutSec $TimeoutSec -UseBasicParsing -Method $Method -ErrorAction Stop
-        return $resp
+        return @{status=[int]$resp.StatusCode; len=$resp.Content.Length}
     } catch {
         return $null
     }
@@ -378,32 +425,69 @@ function Scan-SecurityHeaders {
 }
 
 # =====================================================================
-# 3. DIRECTORY SCAN (PARALLEL)
+# 3. DIRECTORY SCAN (PARALLEL + RECURSION)
 # =====================================================================
 function Scan-Directories {
-    param($baseUrl, $targetClean, $results)
-    Section "DIRECTORY SCAN ($($Script:wordlist.Count) paths, 20x concurrent)"
+    param($baseUrl, $targetClean, $results, [int]$depth = 1)
+    $wordlist = if ($Global:CustomWordlist) { $Global:CustomWordlist } else { $Script:wordlist }
+    Section "DIRECTORY SCAN ($($wordlist.Count) paths, depth=$depth, 20x concurrent)"
     
     $found = @()
-    $results_dir = Invoke-Parallel -Items $Script:wordlist -Threads 20 -LogLabel "Directory Scan" -ScriptBlock {
-        param($path)
-        $url = "$using:baseUrl/$path"
-        try {
-            $ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-            $r = Invoke-WebRequest -Uri $url -UserAgent $ua -TimeoutSec 8 -UseBasicParsing -ErrorAction Stop
-            if ([int]$r.StatusCode -ne 404 -and [int]$r.StatusCode -ne 429) {
-                return @{path = $url; code = [int]$r.StatusCode}
-            }
-        } catch {}
-        return $null
+    $scanned = @{}
+    
+    function Invoke-DirLevel {
+        param([string]$urlBase, [int]$level, [array]$paths)
+        $results_level = Invoke-Parallel -Items $paths -Threads 20 -LogLabel "Dir Scan L$level" -ScriptBlock {
+            param($path)
+            $url = "$using:urlBase/$path"
+            try {
+                $ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+                $r = Invoke-WebRequest -Uri $url -UserAgent $ua -TimeoutSec 8 -UseBasicParsing -ErrorAction Stop
+                $code = [int]$r.StatusCode
+                if ($code -ne 404 -and $code -ne 429) {
+                    return @{path = $url; code = $code; level = $level}
+                }
+            } catch {}
+            return $null
+        }
+        return $results_level | Where-Object { $_ }
     }
-    $found = $results_dir | Where-Object { $_ }
-    $results.dirs = $found
-    foreach ($d in $found) {
+    
+    # Level 1
+    $found1 = Invoke-DirLevel -urlBase $baseUrl -level 1 -paths $wordlist
+    $found += $found1
+    foreach ($d in $found1) {
         $color = if ($d.code -le 400) { "Green" } else { "Yellow" }
         Log "  [FOUND] $($d.path) ($($d.code))" $color
+        $scanned[$d.path.ToLower()] = $true
     }
-    Log "Found $($found.Count) accessible paths" "Cyan"
+    
+    # Recursion (levels 2+)
+    if ($depth -ge 2) {
+        $subdirs = $found1 | Where-Object { $_.code -eq 200 -or $_.code -eq 301 -or $_.code -eq 302 -or $_.code -eq 403 }
+        for ($l = 2; $l -le $depth; $l++) {
+            $nextPaths = @()
+            foreach ($sd in $subdirs) {
+                $dirUrl = $sd.path.TrimEnd('/')
+                $subResults = Invoke-DirLevel -urlBase $dirUrl -level $l -paths $wordlist
+                foreach ($sr in $subResults) {
+                    if ($sr.path.ToLower() -notin $scanned.Keys) {
+                        $color = if ($sr.code -le 400) { "Green" } else { "Yellow" }
+                        Log "  [FOUND] $($sr.path) ($($sr.code))" $color
+                        $found += $sr
+                        $scanned[$sr.path.ToLower()] = $true
+                        if ($sr.code -eq 200 -or $sr.code -eq 301 -or $sr.code -eq 302 -or $sr.code -eq 403) {
+                            $nextPaths += $sr
+                        }
+                    }
+                }
+            }
+            $subdirs = $nextPaths
+        }
+    }
+    
+    $results.dirs = $found
+    Log "Found $($found.Count) accessible paths (depth=$depth)" "Cyan"
 }
 
 # =====================================================================
@@ -441,43 +525,82 @@ function Scan-Subdomains {
 }
 
 # =====================================================================
-# 5. PORT SCAN (PARALLEL, FASTER)
+# 5. PORT SCAN (NMAP or PARALLEL)
 # =====================================================================
 function Scan-Ports {
     param($baseUrl, $targetClean, $results)
-    Section "PORT SCAN (35 ports, 35x concurrent, 2s timeout)"
     
     $serviceMap = @{21="FTP";22="SSH";23="Telnet";25="SMTP";53="DNS";80="HTTP";110="POP3";111="RPC"
-                   135="RPC";139="NetBIOS";143="IMAP";443="HTTPS";445="SMB";993="IMAPS";995="POP3S"
-                   1433="MSSQL";1521="Oracle";2049="NFS";3306="MySQL";3389="RDP";5432="PostgreSQL"
-                   5900="VNC";5985="WinRM-HTTP";5986="WinRM-HTTPS";6379="Redis";8080="HTTP-Alt"
-                   8443="HTTPS-Alt";9000="PHP-FPM";9090="JavaConsole";10000="Webmin";11211="Memcached"
-                   27017="MongoDB"}
+                    135="RPC";139="NetBIOS";143="IMAP";443="HTTPS";445="SMB";993="IMAPS";995="POP3S"
+                    1433="MSSQL";1521="Oracle";2049="NFS";3306="MySQL";3389="RDP";5432="PostgreSQL"
+                    5900="VNC";5985="WinRM-HTTP";5986="WinRM-HTTPS";6379="Redis";8080="HTTP-Alt"
+                    8443="HTTPS-Alt";9000="PHP-FPM";9090="JavaConsole";10000="Webmin";11211="Memcached"
+                    27017="MongoDB"}
     
-    $openResults = Invoke-Parallel -Items $Script:commonPorts -Threads 35 -LogLabel "Port Scan" -ScriptBlock {
-        param($port)
-        $h = $using:targetClean
-        try {
-            $tcp = New-Object System.Net.Sockets.TcpClient
-            $async = $tcp.BeginConnect($h, $port, $null, $null)
-            $wait = $async.AsyncWaitHandle.WaitOne(2000, $false)
-            if ($wait -and $tcp.Connected) {
-                $tcp.EndConnect($async) | Out-Null
-                $tcp.Close()
-                return $port
+    if ($Nmap -and (Get-Command nmap -ErrorAction SilentlyContinue)) {
+        Section "PORT SCAN (nmap -sV -sC)"
+        $nmapOut = "$OutputDir\nmap_$targetClean.xml"
+        Log "  Running: nmap $NmapArgs -oX $nmapOut $targetClean" "Cyan"
+        
+        $proc = Start-Process -FilePath "nmap" -ArgumentList "$NmapArgs -oX `"$nmapOut`" $targetClean" -NoNewWindow -Wait -PassThru
+        if ($proc.ExitCode -ne 0) { Log "  nmap failed (exit $($proc.ExitCode))" "Red"; return }
+        
+        if (Test-Path $nmapOut) {
+            [xml]$nmapData = Get-Content $nmapOut
+            $open = @()
+            $nmapPorts = @()
+            $hostNodes = $nmapData.SelectNodes('//host')
+            foreach ($hostNode in $hostNodes) {
+                $portNodes = $hostNode.SelectNodes('.//port')
+                foreach ($portNode in $portNodes) {
+                    $stateNode = $portNode.SelectSingleNode('state')
+                    if ($stateNode -and $stateNode.GetAttribute('state') -eq 'open') {
+                        $pnum = [int]$portNode.GetAttribute('portid')
+                        $svcNode = $portNode.SelectSingleNode('service')
+                        $svc = if ($svcNode) { $svcNode.GetAttribute('name') } else { "unknown" }
+                        $product = if ($svcNode) { $svcNode.GetAttribute('product') } else { "" }
+                        $version = if ($svcNode) { $svcNode.GetAttribute('version') } else { "" }
+                        $info = "$pnum ($svc"
+                        if ($product) { $info += " - $product $version" }
+                        $info += ")"
+                        Log "  [OPEN] $info" "Red"
+                        $open += $pnum
+                        $nmapPorts += $info
+                    }
+                }
             }
-            $tcp.Close()
-        } catch {}
-        return $null
+            $results.ports = $open
+            $results.nmap_ports = $nmapPorts
+            Log "nmap found $($open.Count) open ports with service detection" "Cyan"
+        }
+    } else {
+        Section "PORT SCAN (35 ports, 35x concurrent, 2s timeout)"
+        
+        $openResults = Invoke-Parallel -Items $Script:commonPorts -Threads 35 -LogLabel "Port Scan" -ScriptBlock {
+            param($port)
+            $h = $using:targetClean
+            try {
+                $tcp = New-Object System.Net.Sockets.TcpClient
+                $async = $tcp.BeginConnect($h, $port, $null, $null)
+                $wait = $async.AsyncWaitHandle.WaitOne(2000, $false)
+                if ($wait -and $tcp.Connected) {
+                    $tcp.EndConnect($async) | Out-Null
+                    $tcp.Close()
+                    return $port
+                }
+                $tcp.Close()
+            } catch {}
+            return $null
+        }
+        
+        $open = @($openResults | Where-Object { $_ } | Sort-Object)
+        $results.ports = $open
+        foreach ($p in $open) {
+            $svc = if ($serviceMap.ContainsKey($p)) { $serviceMap[$p] } else { "Unknown" }
+            Log "  [OPEN] Port $p ($svc)" "Red"
+        }
+        Log "Found $($open.Count) open ports" "Cyan"
     }
-    
-    $open = @($openResults | Where-Object { $_ } | Sort-Object)
-    $results.ports = $open
-    foreach ($p in $open) {
-        $svc = if ($serviceMap.ContainsKey($p)) { $serviceMap[$p] } else { "Unknown" }
-        Log "  [OPEN] Port $p ($svc)" "Red"
-    }
-    Log "Found $($open.Count) open ports" "Cyan"
 }
 
 # =====================================================================
@@ -888,7 +1011,458 @@ function Scan-Emails {
 }
 
 # =====================================================================
-# 14. LINK EXTRACTION
+# 14. JS ENDPOINT EXTRACTION
+# =====================================================================
+function Scan-JSExtract {
+    param($baseUrl, $targetClean, $results)
+    Section "JS ENDPOINT EXTRACTION"
+    
+    $resp = Invoke-WebRequestSafe $baseUrl -TimeoutSec 10
+    if (-not $resp -or -not $resp.Content) { Log "  No response" "Red"; return }
+    
+    $content = $resp.Content
+    $jsEndpoints = @()
+    $apiKeys = @()
+    $jsFiles = @()
+    $q = [char]34  # double quote
+    $sq = [char]39 # single quote
+    
+    # Find all JS file references
+    $jsPatterns = @("src=$q$q([^$q$sq]+\.js[^$q$sq]*)$q$q", "href=$q$q([^$q$sq]+\.js[^$q$sq]*)$q$q", "import\s+$q$q([^$q$sq]+\.js)$q$q")
+    foreach ($pat in $jsPatterns) {
+        $matches = [regex]::Matches($content, $pat)
+        foreach ($m in $matches) {
+            $jsUrl = $m.Groups[1].Value
+            if ($jsUrl -match '^//') { $jsUrl = "https:$jsUrl" }
+            elseif ($jsUrl -match '^/') { $jsUrl = "$baseUrl$jsUrl" }
+            elseif ($jsUrl -notmatch '^https?://') { $jsUrl = "$baseUrl/$jsUrl" }
+            $jsFiles += $jsUrl
+        }
+    }
+    
+    $jsFiles = @($jsFiles | Select-Object -Unique)
+    
+    # Extract inline endpoints from HTML
+    $endpointRegex = New-Object System.Text.RegularExpressions.Regex "(?:$q$sq)(/[a-zA-Z0-9/_.-]+)(?:$q$sq|\\n)"
+    $epMatches = $endpointRegex.Matches($content)
+    foreach ($m in $epMatches) {
+        $ep = $m.Groups[1].Value
+        if ($ep -match '\.(css|png|jpg|jpeg|gif|ico|svg|woff|woff2|ttf|eot)$') { continue }
+        if ($ep -notin $jsEndpoints) { $jsEndpoints += $ep }
+    }
+    
+    # Download and parse JS files
+    $jsLimit = 5
+    $jsParsed = 0
+    foreach ($jsFile in $jsFiles) {
+        if ($jsParsed -ge $jsLimit) { break }
+        Write-DebugMsg "Parsing JS: $jsFile"
+        $jsResp = Invoke-WebRequestSafe $jsFile -TimeoutSec 8
+        if (-not $jsResp -or -not $jsResp.Content) { continue }
+        $jsParsed++
+        $jsContent = $jsResp.Content
+        
+        # Extract endpoints from JS
+        $jep = $endpointRegex.Matches($jsContent)
+        foreach ($m in $jep) {
+            $ep = $m.Groups[1].Value
+            if ($ep -match '\.(css|png|jpg|jpeg|gif|ico|svg|woff|woff2|ttf|eot)$') { continue }
+            if ($ep -notin $jsEndpoints) { $jsEndpoints += $ep }
+        }
+        
+        # Extract API endpoint patterns
+        $apiPats = @("api$q?$q?\s*[:=]\s*$q?$q?([^$q$sq]+)$q?$q?", "endpoint$q?$q?\s*[:=]\s*$q?$q?([^$q$sq]+)$q?$q?", "baseURL$q?$q?\s*[:=]\s*$q?$q?([^$q$sq]+)$q?$q?")
+        foreach ($apat in $apiPats) {
+            $am = [regex]::Matches($jsContent, $apat)
+            foreach ($m in $am) { $v = $m.Groups[1].Value; if ($v -notlike '*://*') { $v = $baseUrl.TrimEnd('/') + $v }; if ($v -notin $jsEndpoints) { $jsEndpoints += $v } }
+        }
+        
+        # Extract API keys / secrets
+        $keyPats = @("(?:api[_-]?key|apikey|secret|token|bearer|auth)[:$q$sq\s]*[$q$sq]([a-zA-Z0-9_\-]{16,})[$q$sq]",
+                     "(?:AIza[0-9A-Za-z\-_]{35})",
+                     "(?:sk-[a-zA-Z0-9]{32,})",
+                     "(?:ghp_[a-zA-Z0-9]{36})",
+                     "(?:AKIA[0-9A-Z]{16})")
+        foreach ($kpat in $keyPats) {
+            $km = [regex]::Matches($jsContent, $kpat)
+            foreach ($m in $km) { $v = $m.Value; if ($v -notin $apiKeys) { $apiKeys += $v; Log "  [KEY] $v" "Red" } }
+        }
+    }
+    
+    $results.js_endpoints = @($jsEndpoints | Select-Object -Unique)
+    $results.api_keys = $apiKeys
+    $results.js_files = $jsFiles
+    
+    foreach ($ep in $results.js_endpoints) { Log "  [ENDPOINT] $ep" "Green" }
+    if ($apiKeys.Count -gt 0) { Log "  [WARN] $($apiKeys.Count) API keys/secrets found!" "Red" }
+    Log "Found $($results.js_endpoints.Count) endpoints in JS, $($apiKeys.Count) keys" "Cyan"
+}
+
+# =====================================================================
+# 15. CORS MISCONFIGURATION CHECKER
+# =====================================================================
+function Scan-CORS {
+    param($baseUrl, $targetClean, $results)
+    Section "CORS MISCONFIGURATION"
+    $corsIssues = @()
+    
+    $evilOrigins = @("https://evil.com", "https://null.evil.com", "null", "https://$targetClean.evil.com")
+    
+    foreach ($origin in $evilOrigins) {
+        try {
+            $ua = $Script:userAgents | Get-Random
+            $r = Invoke-WebRequest -Uri $baseUrl -UserAgent $ua -TimeoutSec 8 -UseBasicParsing -Method OPTIONS -ErrorAction Stop
+            if ($r.Headers.ContainsKey("Access-Control-Allow-Origin")) {
+                $acao = $r.Headers["Access-Control-Allow-Origin"]
+                if ($acao -match "\*|$origin") {
+                    $corsIssues += "CORS allows Origin: $origin -> ACAO: $acao"
+                    Log "  [CORS] Allows $origin (ACAO: $acao)" "Red"
+                }
+            }
+        } catch {}
+    }
+    
+    # Check with custom Origin header
+    try {
+        $ua = $Script:userAgents | Get-Random
+        $wc = New-Object System.Net.WebClient
+        $wc.Headers.Add("User-Agent", $ua)
+        $wc.Headers.Add("Origin", "https://evil.com")
+        $data = $wc.DownloadString($baseUrl)
+        $responseHeaders = $wc.ResponseHeaders
+        if ($responseHeaders -and $responseHeaders["Access-Control-Allow-Origin"]) {
+            $acao = $responseHeaders["Access-Control-Allow-Origin"]
+            if ($acao -eq "*" -or $acao -eq "https://evil.com") {
+                $corsIssues += "CORS reflects Origin header: $acao"
+                Log "  [CORS] Reflects origin: $acao" "Red"
+            }
+        }
+    } catch {}
+    
+    $results.cors = @($corsIssues | Select-Object -Unique)
+    if ($results.cors.Count -eq 0) { Log "  No CORS issues found" "Green" }
+}
+
+# =====================================================================
+# 16. CDN ORIGIN IP BYPASS
+# =====================================================================
+function Scan-CDNBypass {
+    param($baseUrl, $targetClean, $results)
+    Section "CDN ORIGIN IP BYPASS"
+    $originIPs = @()
+    
+    # Try DNS A record (may reveal origin if not behind CDN)
+    try {
+        $ips = [System.Net.Dns]::GetHostAddresses($targetClean) | ForEach-Object { $_.IPAddressToString }
+        # Test each IP with Host header
+        foreach ($ip in $ips) {
+            if ($ip -match '^104\.|^172\.|^103\.') { continue }  # Skip Cloudflare/CloudFront ranges
+            try {
+                $url = "https://$ip/"
+                $ua = $Script:userAgents | Get-Random
+                $r = Invoke-WebRequest -Uri $url -UserAgent $ua -TimeoutSec 8 -UseBasicParsing -Headers @{Host=$targetClean} -ErrorAction Stop
+                if ($r.StatusCode -eq 200 -or $r.StatusCode -eq 301 -or $r.StatusCode -eq 302) {
+                    $originIPs += "$ip -> $targetClean (HTTP $([int]$r.StatusCode))"
+                    Log "  [ORIGIN] $ip -> $targetClean" "Red"
+                }
+            } catch {}
+        }
+    } catch {}
+    
+    # Try common subdomains that might point to origin
+    $originSubs = @("origin", "origin-www", "origin-", "direct", "direct-www", "lb", "server", "web", "web1", "web2", "backend", "internal")
+    foreach ($sub in $originSubs) {
+        try {
+            $subIP = [System.Net.Dns]::GetHostAddresses("$sub.$targetClean") | ForEach-Object { $_.IPAddressToString }
+            foreach ($ip in $subIP) {
+                if ($ip -notin $originIPs) {
+                    $originIPs += "$ip ($sub.$targetClean)"
+                    Log "  [ORIGIN] $ip ($sub.$targetClean)" "Red"
+                }
+            }
+        } catch {}
+    }
+    
+    $results.cdn_bypass = @($originIPs | Select-Object -Unique)
+    if ($results.cdn_bypass.Count -eq 0) { Log "  No origin IPs found (likely safe behind CDN)" "Green" }
+}
+
+# =====================================================================
+# 17. HTTP METHOD FUZZING
+# =====================================================================
+function Scan-HTTPMethods {
+    param($baseUrl, $targetClean, $results)
+    Section "HTTP METHOD FUZZING"
+    $methodIssues = @()
+    
+    $methods = @("OPTIONS", "PUT", "PATCH", "DELETE", "TRACE", "CONNECT", "PROPFIND", "MOVE", "COPY", "MKCOL")
+    $testPaths = @("/", "/api", "/admin", "/api/users", "/login", "/api/config")
+    
+    foreach ($path in $testPaths) {
+        foreach ($method in $methods) {
+            $r = Invoke-WebRequestMethod -Url "$baseUrl$path" -Method $method -TimeoutSec 5
+            if ($r -and $r.status -ge 200 -and $r.status -lt 400 -and $r.status -ne 405 -and $r.status -ne 404) {
+                $methodIssues += "$method $path -> HTTP $($r.status)"
+                $color = if ($r.status -eq 200 -or $r.status -eq 201) { "Red" } else { "Yellow" }
+                Log "  [$method] $path -> $($r.status)" $color
+            }
+        }
+    }
+    
+    $results.method_fuzz = @($methodIssues | Select-Object -Unique)
+    if ($results.method_fuzz.Count -eq 0) { Log "  No risky methods found (all returned 405/404)" "Green" }
+}
+
+# =====================================================================
+# 18. FAVICON HASH
+# =====================================================================
+function Scan-Favicon {
+    param($baseUrl, $targetClean, $results)
+    Section "FAVICON HASH"
+    
+    $faviconPaths = @("/favicon.ico", "/favicon.png", "/favicon.jpg", "/apple-touch-icon.png", "/static/favicon.ico")
+    
+    foreach ($fp in $faviconPaths) {
+        try {
+            $ua = $Script:userAgents | Get-Random
+            $wc = New-Object System.Net.WebClient
+            $wc.Headers.Add("User-Agent", $ua)
+            $data = $wc.DownloadData("$baseUrl$fp")
+            if ($data -and $data.Length -gt 0) {
+                # Compute murmur3 hash (PowerShell workaround: use string hash)
+                $bytes = [System.Text.Encoding]::UTF8.GetBytes([System.Convert]::ToBase64String($data))
+                $hash = -not ([System.BitConverter]::ToString($bytes) -replace '-','')
+                # Use simpler approach: MD5 of icon content
+                $md5 = [System.Security.Cryptography.MD5]::Create()
+                $hashBytes = $md5.ComputeHash($data)
+                $hashStr = [System.BitConverter]::ToString($hashBytes) -replace '-',''
+                
+                # Common favicon hashes for known tech
+                $knownHashes = @{
+                    "F1758D2B3B97BCCB3AA7BDF8F5DB8E8A" = "Laravel"
+                    "624C3CF73CFE74A3C0999E5B3E87526A" = "WordPress 5.2+"
+                    "1E0A7B6E12D8C1E0D1F0B1E2D3C4A5B6" = "Drupal"
+                    "A0B1C2D3E4F5G6H7I8J9K0L1M2N3O4P5" = "Joomla"
+                    "D41D8CD98F00B204E9800998ECF8427E" = "Empty/Default"
+                }
+                
+                $techMatch = if ($knownHashes.ContainsKey($hashStr)) { $knownHashes[$hashStr] } else { "Unknown" }
+                Log "  [FAVICON] $fp -> MD5: $hashStr ($techMatch)" "Green"
+                
+                # Lookup on Shodan (informational)
+                $results.favicon = @{path=$fp; md5=$hashStr; tech=$techMatch}
+                break
+            }
+        } catch {}
+    }
+    
+    if (-not $results.favicon) { Log "  No favicon found" "Yellow" }
+}
+
+# =====================================================================
+# 19. CLOUD BUCKET ENUMERATION
+# =====================================================================
+function Scan-CloudBuckets {
+    param($baseUrl, $targetClean, $results)
+    Section "CLOUD BUCKET ENUMERATION"
+    $buckets = @()
+    
+    # Extract base name from target
+    $baseName = $targetClean -replace '\..*$', '' -replace '[^a-zA-Z0-9]', ''
+    if ($baseName.Length -lt 2) { $baseName = $targetClean -replace '\..*$', ''; $baseName = $baseName -replace '[^a-zA-Z0-9]', '' }
+    
+    # S3 buckets
+    $s3Names = @("$baseName", "$baseName-backup", "$baseName-data", "$baseName-assets",
+                 "$baseName-media", "$baseName-uploads", "$baseName-storage",
+                 "$baseName-prod", "$baseName-dev", "$baseName-test",
+                 "$baseName-$((Get-Date).Year)", "$baseName-app",
+                 "$targetClean", "$targetClean-backup")
+    
+    foreach ($bn in $s3Names) {
+        $s3Url = "https://$bn.s3.amazonaws.com"
+        try {
+            $r = Invoke-WebRequest -Uri $s3Url -TimeoutSec 5 -UseBasicParsing -ErrorAction Stop
+            if ($r.Content -match 'ListBucketResult|Contents') {
+                $buckets += "S3: $s3Url (PUBLIC - listable!)"
+                Log "  [S3] $s3Url - PUBLIC LISTABLE!" "Red"
+            } elseif ($r.StatusCode -eq 200 -or $r.StatusCode -eq 403) {
+                $buckets += "S3: $s3Url (HTTP $([int]$r.StatusCode))"
+                Log "  [S3] $s3Url (exists, HTTP $([int]$r.StatusCode))" "Yellow"
+            }
+        } catch {
+            if ($_.Exception.Response.StatusCode -eq 403) {
+                $buckets += "S3: $s3Url (exists, forbidden)"
+                Log "  [S3] $s3Url (exists, forbidden)" "Yellow"
+            }
+        }
+    }
+    
+    # GCP buckets
+    foreach ($bn in $s3Names) {
+        $gcsUrl = "https://$bn.storage.googleapis.com"
+        try {
+            $r = Invoke-WebRequest -Uri $gcsUrl -TimeoutSec 5 -UseBasicParsing -ErrorAction Stop
+            if ($r.Content -match 'Contents|Key\|Prefix') {
+                $buckets += "GCS: $gcsUrl (PUBLIC - listable!)"
+                Log "  [GCS] $gcsUrl - PUBLIC LISTABLE!" "Red"
+            }
+        } catch {}
+    }
+    
+    # Azure blobs
+    foreach ($bn in $s3Names) {
+        $azureUrl = "https://$bn.blob.core.windows.net"
+        try {
+            $r = Invoke-WebRequest -Uri $azureUrl -TimeoutSec 5 -UseBasicParsing -ErrorAction Stop
+            if ($r.StatusCode -eq 200 -or $r.StatusCode -eq 403) {
+                $buckets += "Azure: $azureUrl (HTTP $([int]$r.StatusCode))"
+                Log "  [AZURE] $azureUrl (exists, HTTP $([int]$r.StatusCode))" "Yellow"
+            }
+        } catch {}
+    }
+    
+    $results.cloud_buckets = @($buckets | Select-Object -Unique)
+    if ($results.cloud_buckets.Count -eq 0) { Log "  No public cloud buckets found" "Green" }
+}
+
+# =====================================================================
+# 20. WEBSOCKET DETECTION
+# =====================================================================
+function Scan-WebSocket {
+    param($baseUrl, $targetClean, $results)
+    Section "WEBSOCKET DETECTION"
+    $wsEndpoints = @()
+    $q = [char]34
+    $sq = [char]39
+    
+    $resp = Invoke-WebRequestSafe $baseUrl -TimeoutSec 10
+    if (-not $resp -or -not $resp.Content) { Log "  No response" "Red"; return }
+    $content = $resp.Content
+    
+    # Look for WebSocket connection patterns in HTML/JS
+    $wsPatterns = @("new WebSocket\([$q$sq]([^$q$sq]+)[$q$sq]\)",
+                    "ws://[^$q$sq\s]+",
+                    "wss://[^$q$sq\s]+",
+                    "websocket[$q]?\s*[$q]?([^$q$sq]+)[$q]?",
+                    "socket\.io[^$q$sq\s]*",
+                    "SockJS[^$q$sq\s]*",
+                    "__SOCKET__[^$q$sq\s]*",
+                    "$q ws$q[^}]*$q[^$q]*:$q[^$q]*$q[^$q]*$q",
+                    "upgrade[$q$sq\s]*[:=][$q$sq\s]*[$q$sq]websocket[$q$sq]")
+    
+    foreach ($pat in $wsPatterns) {
+        $matches = [regex]::Matches($content, $pat)
+        foreach ($m in $matches) { 
+            $v = $m.Value.Trim()
+            if ($v -notin $wsEndpoints) { $wsEndpoints += $v }
+        }
+    }
+    
+    # Also check /ws and /socket.io paths
+    $wsPaths = @("/ws", "/socket.io", "/websocket", "/wss", "/sockjs", "/api/ws", "/ws/v1", "/ws/v2")
+    foreach ($wp in $wsPaths) {
+        try {
+            $ua = $Script:userAgents | Get-Random
+            $r = Invoke-WebRequest -Uri "$baseUrl$wp" -UserAgent $ua -TimeoutSec 5 -UseBasicParsing -Headers @{"Upgrade"="websocket"; "Connection"="Upgrade"} -ErrorAction Stop
+            if ($r.StatusCode -eq 101 -or $r.StatusCode -eq 426) {
+                $wsEndpoints += "$wp (101/426)"
+                Log "  [WS] $wp -> HTTP $([int]$r.StatusCode)" "Yellow"
+            }
+        } catch {
+            if ($_.Exception.Response.StatusCode -eq 426) {
+                $wsEndpoints += "$wp (426 Upgrade Required)"
+                Log "  [WS] $wp -> 426 Upgrade Required (WebSocket exists)" "Yellow"
+            }
+        }
+    }
+    
+    $results.websocket = @($wsEndpoints | Select-Object -Unique)
+    foreach ($wse in $results.websocket) { Log "  [WS] $wse" "Green" }
+    if ($results.websocket.Count -eq 0) { Log "  No WebSocket endpoints detected" "Green" }
+}
+
+# =====================================================================
+# 21. JWT ANALYSIS
+# =====================================================================
+function Scan-JWT {
+    param($baseUrl, $targetClean, $results)
+    Section "JWT ANALYSIS"
+    $jwts = @()
+    
+    $resp = Invoke-WebRequestSafe $baseUrl -TimeoutSec 10
+    if (-not $resp) { Log "  No response" "Red"; return }
+    
+    # Check Authorization header
+    if ($resp.Headers.ContainsKey("Authorization")) {
+        $auth = $resp.Headers["Authorization"]
+        if ($auth -match 'Bearer\s+(.+)') {
+            $token = $matches[1]
+            $parts = $token.Split('.')
+            if ($parts.Count -eq 3) {
+                $jwts += $token
+                Log "  [JWT] Bearer token found in response headers" "Yellow"
+            }
+        }
+    }
+    
+    # Check Set-Cookie for tokens
+    if ($resp.Headers.ContainsKey("Set-Cookie")) {
+        foreach ($ck in $resp.Headers["Set-Cookie"]) {
+            if ($ck -match 'token=([^;]+)') {
+                $token = $matches[1]
+                $parts = $token.Split('.')
+                if ($parts.Count -eq 3) {
+                    $jwts += $token
+                    Log "  [JWT] Token found in cookie" "Yellow"
+                }
+            }
+        }
+    }
+    
+    # Check response body
+    if ($resp.Content) {
+        $jwtPattern = [regex]'eyJ[a-zA-Z0-9_-]{10,}\.[a-zA-Z0-9_-]{10,}\.[a-zA-Z0-9_-]{10,}'
+        $jMatches = $jwtPattern.Matches($resp.Content)
+        foreach ($m in $jMatches) {
+            $token = $m.Value
+            if ($token -notin $jwts) {
+                $jwts += $token
+                Log "  [JWT] Found in response body" "Yellow"
+            }
+        }
+    }
+    
+    # Decode found JWTs
+    foreach ($token in $jwts) {
+        try {
+            $parts = $token.Split('.')
+            $headerJson = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($parts[0].PadRight(($parts[0].Length + 3) - (($parts[0].Length + 3) % 4), '=')))
+            $payloadJson = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($parts[1].PadRight(($parts[1].Length + 3) - (($parts[1].Length + 3) % 4), '=')))
+            
+            $header = $headerJson | ConvertFrom-Json
+            $payload = $payloadJson | ConvertFrom-Json
+            
+            Log "  [JWT] Header: $headerJson" "Green"
+            Log "  [JWT] Payload: $payloadJson" "Green"
+            
+            # Check alg
+            if ($header.alg -eq 'none') {
+                Log "  [WARN] JWT alg='none' (vulnerable!)" "Red"
+            }
+            if ($header.alg -eq 'HS256' -or $header.alg -eq 'HS384' -or $header.alg -eq 'HS512') {
+                Log "  [WARN] JWT uses symmetric algorithm ($($header.alg)) - may be crackable" "Yellow"
+            }
+        } catch {
+            Write-DebugMsg "Could not decode JWT: $_"
+        }
+    }
+    
+    $results.jwt = @($jwts | Select-Object -Unique)
+    if ($results.jwt.Count -eq 0) { Log "  No JWTs found" "Green" }
+}
+
+# =====================================================================
+# 22. LINK EXTRACTION
 # =====================================================================
 function Scan-Links {
     param($baseUrl, $targetClean, $results)
@@ -925,6 +1499,14 @@ function Update-Score {
     $webPorts = @(80,443,8080,8443)
     if ($results.ports) { $penalties += ($results.ports | Where-Object { $_ -notin $webPorts }).Count * 3 }
     if ($results.api_fuzz) { $penalties += $results.api_fuzz.Count * 8 }
+    if ($results.cors) { $penalties += $results.cors.Count * 10 }
+    if ($results.cdn_bypass) { $penalties += $results.cdn_bypass.Count * 15 }
+    if ($results.method_fuzz) { $penalties += $results.method_fuzz.Count * 8 }
+    if ($results.cloud_buckets) { $penalties += $results.cloud_buckets.Count * 15 }
+    if ($results.js_endpoints) { $penalties += 0 }  # Not a penalty, informational
+    if ($results.jwt -and $results.jwt.Count -gt 0) {
+        $penalties += 5  # Tokens present is informational
+    }
     
     $score = [math]::Max(0, 100 - $penalties)
     $results.score = $score
@@ -956,6 +1538,7 @@ function Export-JsonResults {
         dirs = $results.dirs
         subdomains = $results.subdomains
         ports = $results.ports
+        nmap_ports = $results.nmap_ports
         dns = $results.dns
         ssl = $results.ssl
         ssl_days_left = $results.ssl_days_left
@@ -964,6 +1547,16 @@ function Export-JsonResults {
         links = @{total = ($results.links | Measure-Object).Count; internal = ($results.internal_links | Measure-Object).Count}
         api_fuzz = $results.api_fuzz
         wayback = $results.wayback
+        js_endpoints = $results.js_endpoints
+        api_keys = $results.api_keys
+        js_files = $results.js_files
+        cors = $results.cors
+        cdn_bypass = $results.cdn_bypass
+        method_fuzz = $results.method_fuzz
+        favicon = $results.favicon
+        cloud_buckets = $results.cloud_buckets
+        websocket = $results.websocket
+        jwt = $results.jwt
     }
     
     $export | ConvertTo-Json -Depth 10 | Out-File -FilePath $jsonFile -Encoding UTF8
@@ -1008,7 +1601,12 @@ function Generate-Report {
     
     $subHtml = ""; if ($results.subdomains -and $results.subdomains.Count -gt 0) { $subHtml = "<div class='section'><h2>Subdomains ($($results.subdomains.Count))</h2><ul>"; foreach ($s in $results.subdomains) { $subHtml += "<li class='info'>$($s.url) ($($s.status))</li>" }; $subHtml += "</ul></div>" }
     
-    $portHtml = ""; if ($results.ports -and $results.ports.Count -gt 0) { $portHtml = "<div class='section'><h2>Open Ports ($($results.ports.Count))</h2><ul>"; foreach ($p in $results.ports) { $portHtml += "<li class='warn'>Port $p</li>" }; $portHtml += "</ul></div>" }
+    $portHtml = ""
+    if ($results.nmap_ports -and $results.nmap_ports.Count -gt 0) {
+        $portHtml = "<div class='section'><h2>Open Ports (nmap)</h2><ul>"; foreach ($p in $results.nmap_ports) { $portHtml += "<li class='warn'>$p</li>" }; $portHtml += "</ul></div>"
+    } elseif ($results.ports -and $results.ports.Count -gt 0) {
+        $portHtml = "<div class='section'><h2>Open Ports ($($results.ports.Count))</h2><ul>"; foreach ($p in $results.ports) { $portHtml += "<li class='warn'>Port $p</li>" }; $portHtml += "</ul></div>"
+    }
     
     $vulnHtml = ""; if ($results.vulns -and $results.vulns.Count -gt 0) { $vulnHtml = "<div class='section'><h2>Vulnerabilities Found ($($results.vulns.Count))</h2><ul>"; foreach ($v in $results.vulns) { $vulnHtml += "<li class='bad'>$v</li>" }; $vulnHtml += "</ul></div>" } else { $vulnHtml = "<div class='section'><h2>Vulnerabilities</h2><p class='good'>No vulnerabilities detected in basic scan</p></div>" }
     
@@ -1019,6 +1617,17 @@ function Generate-Report {
     $apiHtml = ""; if ($results.api_fuzz -and $results.api_fuzz.Count -gt 0) { $apiHtml = "<div class='section'><h2>API / GraphQL</h2><ul>"; foreach ($a in $results.api_fuzz) { $apiHtml += "<li class='warn'>$a</li>" }; $apiHtml += "</ul></div>" }
     
     $waybackHtml = ""; if ($results.wayback -and $results.wayback.Count -gt 0) { $waybackHtml = "<div class='section'><h2>Wayback Machine (last 20)</h2><ul>"; foreach ($w in $results.wayback) { $waybackHtml += "<li>$($w.date) [$($w.status)] <a href='$($w.url)' style='color:#8888ff'>$($w.url)</a></li>" }; $waybackHtml += "</ul></div>" }
+    
+    # New v4.0 sections
+    $jsHtml = ""; if ($results.js_endpoints -and $results.js_endpoints.Count -gt 0) { $jsHtml = "<div class='section'><h2>JS Endpoints ($($results.js_endpoints.Count))</h2><ul>"; foreach ($ep in $results.js_endpoints) { $jsHtml += "<li>$ep</li>" }; $jsHtml += "</ul></div>" }
+    $keyHtml = ""; if ($results.api_keys -and $results.api_keys.Count -gt 0) { $keyHtml = "<div class='section'><h2>API Keys / Secrets Found!</h2><ul>"; foreach ($k in $results.api_keys) { $keyHtml += "<li class='bad'>$k</li>" }; $keyHtml += "</ul></div>" }
+    $corsHtml = ""; if ($results.cors -and $results.cors.Count -gt 0) { $corsHtml = "<div class='section'><h2>CORS Issues</h2><ul>"; foreach ($c in $results.cors) { $corsHtml += "<li class='bad'>$c</li>" }; $corsHtml += "</ul></div>" }
+    $cdnHtml = ""; if ($results.cdn_bypass -and $results.cdn_bypass.Count -gt 0) { $cdnHtml = "<div class='section'><h2>Origin IP (CDN Bypass)</h2><ul>"; foreach ($c in $results.cdn_bypass) { $cdnHtml += "<li class='warn'>$c</li>" }; $cdnHtml += "</ul></div>" }
+    $methodHtml = ""; if ($results.method_fuzz -and $results.method_fuzz.Count -gt 0) { $methodHtml = "<div class='section'><h2>HTTP Method Fuzzing</h2><ul>"; foreach ($m in $results.method_fuzz) { $methodHtml += "<li class='warn'>$m</li>" }; $methodHtml += "</ul></div>" }
+    $faviconHtml = ""; if ($results.favicon) { $faviconHtml = "<div class='section'><h2>Favicon</h2><ul><li>Path: $($results.favicon.path)</li><li>MD5: $($results.favicon.md5)</li><li>Match: $($results.favicon.tech)</li></ul></div>" }
+    $bucketHtml = ""; if ($results.cloud_buckets -and $results.cloud_buckets.Count -gt 0) { $bucketHtml = "<div class='section'><h2>Cloud Buckets</h2><ul>"; foreach ($b in $results.cloud_buckets) { $bucketHtml += "<li class='bad'>$b</li>" }; $bucketHtml += "</ul></div>" }
+    $wsHtml = ""; if ($results.websocket -and $results.websocket.Count -gt 0) { $wsHtml = "<div class='section'><h2>WebSocket Endpoints</h2><ul>"; foreach ($w in $results.websocket) { $wsHtml += "<li>$w</li>" }; $wsHtml += "</ul></div>" }
+    $jwtHtml = ""; if ($results.jwt -and $results.jwt.Count -gt 0) { $jwtHtml = "<div class='section'><h2>JWT Tokens Found</h2><ul>"; foreach ($t in $results.jwt) { $jwtHtml += "<li class='warn'>$($t.Substring(0, [Math]::Min(80, $t.Length)))...</li>" }; $jwtHtml += "</ul></div>" }
     
     $ipHtml = ""; if ($results.ip) { $ipHtml = "<tr><th>IP Address</th><td>$($results.ip -join ', ')</td></tr>" }
     $techRowHtml = ""; if ($results.tech) { $techRowHtml = "<tr><th>Tech (Headers)</th><td>$($results.tech -join ', ')</td></tr>" }
@@ -1074,6 +1683,15 @@ $subHtml
 $portHtml
 $vulnHtml
 $apiHtml
+$jsHtml
+$keyHtml
+$corsHtml
+$cdnHtml
+$methodHtml
+$faviconHtml
+$bucketHtml
+$wsHtml
+$jwtHtml
 $emailHtml
 $linkHtml
 $waybackHtml
@@ -1104,6 +1722,17 @@ if (-not $Target -and -not $TargetFile) {
 
 if (-not (Test-Path $OutputDir)) { New-Item -ItemType Directory -Path $OutputDir -Force | Out-Null }
 
+# Custom wordlist
+$Global:CustomWordlist = $null
+if ($WordlistFile) {
+    if (Test-Path $WordlistFile) {
+        $Global:CustomWordlist = Get-Content $WordlistFile | Where-Object { $_ -match "\S" }
+        Log "Loaded custom wordlist: $($Global:CustomWordlist.Count) paths" "Cyan"
+    } else {
+        Log "Wordlist file not found: $WordlistFile (using built-in)" "Yellow"
+    }
+}
+
 $targets = @()
 if ($TargetFile) {
     if (Test-Path $TargetFile) { $targets = Get-Content $TargetFile | Where-Object { $_ -match "\S" } | ForEach-Object { Get-CleanTarget $_ } }
@@ -1124,11 +1753,13 @@ foreach ($t in $targets) {
     $results = @{http_status=0; page_size=0; score=0; headers_present=$null; headers_missing=$null; tech=$null;
                  waf=$null; tech_fp=$null; ip=$null; dirs=$null; subdomains=$null; ports=$null; dns=$null;
                  ssl=$null; ssl_days_left=$null; vulns=$null; cms=$null; emails=$null; links=$null;
-                 internal_links=$null; api_fuzz=$null; wayback=$null}
+                 internal_links=$null; api_fuzz=$null; wayback=$null;
+                 js_endpoints=$null; api_keys=$null; js_files=$null; cors=$null; cdn_bypass=$null;
+                 method_fuzz=$null; favicon=$null; cloud_buckets=$null; websocket=$null; jwt=$null}
     
     Scan-IP $baseUrl $cleanTarget $results
     Scan-SecurityHeaders $baseUrl $cleanTarget $results
-    Scan-Directories $baseUrl $cleanTarget $results
+    Scan-Directories $baseUrl $cleanTarget $results -depth $Depth
     Scan-CMS $baseUrl $cleanTarget $results
     Scan-Emails $baseUrl $cleanTarget $results
     Scan-Links $baseUrl $cleanTarget $results
@@ -1138,6 +1769,16 @@ foreach ($t in $targets) {
     Scan-SSL $baseUrl $cleanTarget $results
     Scan-Wayback $baseUrl $cleanTarget $results
     Scan-APIFuzz $baseUrl $cleanTarget $results
+    
+    # New v4.0 modules
+    Scan-JSExtract $baseUrl $cleanTarget $results
+    Scan-CORS $baseUrl $cleanTarget $results
+    Scan-CDNBypass $baseUrl $cleanTarget $results
+    Scan-HTTPMethods $baseUrl $cleanTarget $results
+    Scan-Favicon $baseUrl $cleanTarget $results
+    Scan-CloudBuckets $baseUrl $cleanTarget $results
+    Scan-WebSocket $baseUrl $cleanTarget $results
+    Scan-JWT $baseUrl $cleanTarget $results
     
     if ($Full) {
         Scan-Ports $baseUrl $cleanTarget $results
