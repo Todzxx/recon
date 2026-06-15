@@ -221,19 +221,64 @@ function Invoke-WebRequestSafe {
     $maxRetries = 3
     for ($attempt = 0; $attempt -lt $maxRetries; $attempt++) {
         try {
+            [System.Net.ServicePointManager]::ServerCertificateValidationCallback = {$true}
+            $wr = [System.Net.WebRequest]::Create($Url)
+            $wr.Method = $Method
+            $wr.Timeout = ($TimeoutSec * 1000)
             $ua = $Script:userAgents | Get-Random
-            $params = @{Uri=$Url; UserAgent=$ua; TimeoutSec=$TimeoutSec; UseBasicParsing=$true; Method=$Method; ErrorAction="Stop"}
-            if ($Body -and $ContentType) { $params["Body"] = $Body; $params["ContentType"] = $ContentType }
-            $resp = Invoke-WebRequest @params
-            return $resp
-        } catch {
-            if ($_.Exception.Response.StatusCode -eq 429 -and $attempt -lt ($maxRetries - 1)) {
-                $wait = [Math]::Pow(2, $attempt + 1)
-                Write-DebugMsg "429 rate limited, retrying in ${wait}s (attempt $($attempt+1)/$maxRetries)"
-                Start-Sleep -Seconds $wait
-            } else {
-                return $null
+            $wr.UserAgent = $ua
+            if ($Body -and $ContentType) {
+                $wr.ContentType = $ContentType
+                $bytes = [System.Text.Encoding]::UTF8.GetBytes($Body)
+                $wr.ContentLength = $bytes.Length
+                $stream = $wr.GetRequestStream(); $stream.Write($bytes,0,$bytes.Length); $stream.Close()
             }
+            $resp = $null; $code = 0; $bodyText = ""; $headersTable = @{}
+            try {
+                $resp = $wr.GetResponse()
+                $code = [int][System.Net.HttpWebResponse]$resp.StatusCode
+            } catch {
+                $ex = $_.Exception
+                if ($ex.InnerException -and $ex.InnerException.Response) { $resp = $ex.InnerException.Response }
+                elseif ($ex.Response) { $resp = $ex.Response }
+                if ($resp) { $code = [int]([System.Net.HttpWebResponse]$resp).StatusCode }
+            }
+            if ($resp) {
+                $reader = New-Object System.IO.StreamReader($resp.GetResponseStream())
+                $bodyText = $reader.ReadToEnd(); $reader.Close()
+                try {
+                    $webResp = [System.Net.HttpWebResponse]$resp
+                    foreach ($hk in $webResp.Headers.AllKeys) {
+                        $hv = $webResp.Headers[$hk]
+                        if ($headersTable.ContainsKey($hk)) {
+                            $existing = $headersTable[$hk]
+                            if ($existing -is [array]) { $headersTable[$hk] = $existing + $hv }
+                            else { $headersTable[$hk] = @($existing, $hv) }
+                        } else { $headersTable[$hk] = $hv }
+                    }
+                } catch {}
+                $resp.Close()
+            }
+            # Rate limit detected — warn and backoff
+            if ($code -eq 429) {
+                $wait = [Math]::Min(30, [Math]::Pow(2, $attempt + 2))
+                $msg = "429 rate limited"
+                try { $retryHdr = $headersTable["Retry-After"]; if ($retryHdr) { $wait = [int]$retryHdr } } catch {}
+                Write-DebugMsg ($msg + ", waiting " + $wait + "s (attempt " + ($attempt+1) + "/" + $maxRetries + ")")
+                if ($attempt -lt ($maxRetries - 1)) { Start-Sleep -Seconds $wait; continue }
+                else { Write-DebugMsg ("429 persists after " + $maxRetries + " retries") }
+            }
+            $result = New-Object PSObject
+            $result | Add-Member -MemberType NoteProperty -Name "StatusCode" -Value $code
+            $result | Add-Member -MemberType NoteProperty -Name "Content" -Value $bodyText
+            $result | Add-Member -MemberType NoteProperty -Name "Headers" -Value $headersTable
+            $result | Add-Member -MemberType NoteProperty -Name "RawContentLength" -Value $bodyText.Length
+            return $result
+        } catch {
+            if ($attempt -ge ($maxRetries - 1)) { return $null }
+            $wait = [Math]::Pow(2, $attempt + 1)
+            Write-DebugMsg "Request failed, retry $($attempt+1)/$maxRetries in ${wait}s"
+            Start-Sleep -Seconds $wait
         }
     }
     return $null
@@ -242,23 +287,58 @@ function Invoke-WebRequestSafe {
 function Invoke-WebRequestMethod {
     param([string]$Url, [string]$Method, [int]$TimeoutSec = 8)
     try {
-        $ua = $Script:userAgents | Get-Random
-        $resp = Invoke-WebRequest -Uri $Url -UserAgent $ua -TimeoutSec $TimeoutSec -UseBasicParsing -Method $Method -ErrorAction Stop
-        return @{status=[int]$resp.StatusCode; len=$resp.Content.Length}
-    } catch {
-        return $null
-    }
+        [System.Net.ServicePointManager]::ServerCertificateValidationCallback = {$true}
+        $wr = [System.Net.WebRequest]::Create($Url)
+        $wr.Method = $Method; $wr.Timeout = ($TimeoutSec * 1000)
+        $wr.UserAgent = $Script:userAgents | Get-Random
+        $resp = $null
+        try { $resp = $wr.GetResponse() } catch {
+            $ex = $_.Exception
+            if ($ex.InnerException -and $ex.InnerException.Response) { $resp = $ex.InnerException.Response }
+            elseif ($ex.Response) { $resp = $ex.Response }
+        }
+        $code = if ($resp) { [int][System.Net.HttpWebResponse]$resp.StatusCode } else { 0 }
+        $len = 0
+        if ($resp) { $reader = New-Object System.IO.StreamReader($resp.GetResponseStream()); $len = $reader.ReadToEnd().Length; $reader.Close(); $resp.Close() }
+        return @{status=$code; len=$len}
+    } catch { return $null }
 }
 
 function Invoke-WebRequestQuick {
     param([string]$Url, [int]$TimeoutSec = 8)
     try {
-        $ua = $Script:userAgents | Get-Random
-        $resp = Invoke-WebRequest -Uri $Url -UserAgent $ua -TimeoutSec $TimeoutSec -UseBasicParsing -ErrorAction Stop
-        return @{Status = [int]$resp.StatusCode; Headers = $resp.Headers; Raw = $resp}
-    } catch {
-        return $null
-    }
+        [System.Net.ServicePointManager]::ServerCertificateValidationCallback = {$true}
+        $wr = [System.Net.WebRequest]::Create($Url)
+        $wr.Method = "GET"; $wr.Timeout = ($TimeoutSec * 1000)
+        $wr.UserAgent = $Script:userAgents | Get-Random
+        $resp = $null
+        try { $resp = $wr.GetResponse() } catch {
+            $ex = $_.Exception
+            if ($ex.InnerException -and $ex.InnerException.Response) { $resp = $ex.InnerException.Response }
+            elseif ($ex.Response) { $resp = $ex.Response }
+        }
+        $code = if ($resp) { [int][System.Net.HttpWebResponse]$resp.StatusCode } else { 0 }
+        $bodyTxt = ""
+        $hdrs = @{}
+        if ($resp) {
+            $reader = New-Object System.IO.StreamReader($resp.GetResponseStream())
+            $bodyTxt = $reader.ReadToEnd(); $reader.Close()
+            try {
+                $webResp = [System.Net.HttpWebResponse]$resp
+                foreach ($hk in $webResp.Headers.AllKeys) {
+                    $hv = $webResp.Headers[$hk]
+                    if ($hdrs.ContainsKey($hk)) { $existing = $hdrs[$hk]; if ($existing -is [array]) { $hdrs[$hk] = $existing + $hv } else { $hdrs[$hk] = @($existing, $hv) } }
+                    else { $hdrs[$hk] = $hv }
+                }
+            } catch {}
+            $resp.Close()
+        }
+        $result = New-Object PSObject
+        $result | Add-Member -MemberType NoteProperty -Name "Status" -Value $code
+        $result | Add-Member -MemberType NoteProperty -Name "Headers" -Value $hdrs
+        $result | Add-Member -MemberType NoteProperty -Name "Content" -Value $bodyTxt
+        return $result
+    } catch { return $null }
 }
 
 # Parallel execution helper (works in PS 5.1 via RunspacePool)
@@ -437,15 +517,25 @@ function Scan-Directories {
     
     function Invoke-DirLevel {
         param([string]$urlBase, [int]$level, [array]$paths)
-        $results_level = Invoke-Parallel -Items $paths -Threads 20 -LogLabel "Dir Scan L$level" -ScriptBlock {
-            param($path)
-            $url = "$using:urlBase/$path"
+        $items = $paths | ForEach-Object { @{p=$_; b=$urlBase; l=$level} }
+        $results_level = Invoke-Parallel -Items $items -Threads 20 -LogLabel "Dir Scan L$level" -ScriptBlock {
+            param($d)
+            $url = $d.b + "/" + $d.p
             try {
-                $ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-                $r = Invoke-WebRequest -Uri $url -UserAgent $ua -TimeoutSec 8 -UseBasicParsing -ErrorAction Stop
-                $code = [int]$r.StatusCode
+                [System.Net.ServicePointManager]::ServerCertificateValidationCallback = {$true}
+                $wr = [System.Net.WebRequest]::Create($url)
+                $wr.Method = "GET"; $wr.Timeout = 8000
+                $wr.UserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+                $resp = $null
+                try { $resp = $wr.GetResponse() } catch {
+                    $ex = $_.Exception
+                    if ($ex.InnerException -and $ex.InnerException.Response) { $resp = $ex.InnerException.Response }
+                    elseif ($ex.Response) { $resp = $ex.Response }
+                }
+                $code = if ($resp) { [int][System.Net.HttpWebResponse]$resp.StatusCode } else { 0 }
+                if ($resp) { $resp.Close() }
                 if ($code -ne 404 -and $code -ne 429) {
-                    return @{path = $url; code = $code; level = $level}
+                    return @{path = $url; code = $code; level = $d.l}
                 }
             } catch {}
             return $null
@@ -497,21 +587,30 @@ function Scan-Subdomains {
     param($baseUrl, $targetClean, $results)
     Section "SUBDOMAIN ENUMERATION ($($Script:subdomainList.Count) subs, 30x concurrent)"
     
-    $found = Invoke-Parallel -Items $Script:subdomainList -Threads 30 -LogLabel "Subdomain Scan" -ScriptBlock {
-        param($sub)
-        $url = "https://$sub.$using:targetClean"
+    $items = $Script:subdomainList | ForEach-Object { @{s=$_; t=$targetClean} }
+    $found = Invoke-Parallel -Items $items -Threads 30 -LogLabel "Subdomain Scan" -ScriptBlock {
+        param($d)
+        $url = "https://" + $d.s + "." + $d.t
         try {
-            $ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-            $r = Invoke-WebRequest -Uri $url -UserAgent $ua -TimeoutSec 8 -UseBasicParsing -ErrorAction Stop
-            $code = [int]$r.StatusCode
+            [System.Net.ServicePointManager]::ServerCertificateValidationCallback = {$true}
+            $wr = [System.Net.WebRequest]::Create($url)
+            $wr.Method = "GET"; $wr.Timeout = 8000
+            $wr.UserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+            $resp = $null
+            try { $resp = $wr.GetResponse() } catch {
+                $ex = $_.Exception
+                if ($ex.InnerException -and $ex.InnerException.Response) { $resp = $ex.InnerException.Response }
+                elseif ($ex.Response) { $resp = $ex.Response }
+            }
+            $code = if ($resp) { [int][System.Net.HttpWebResponse]$resp.StatusCode } else { 0 }
+            if ($resp) { $resp.Close() }
             if ($code -ne 404 -and $code -ne 429 -and $code -ne 0) {
-                return @{subdomain = $sub; url = $url; status = $code}
+                return @{subdomain = $d.s; url = $url; status = $code}
             }
         } catch {
-            # Check if DNS resolves even if HTTP fails
             try {
-                $null = [System.Net.Dns]::GetHostEntry("$sub.$using:targetClean")
-                return @{subdomain = $sub; url = $url; status = "DNS-only"}
+                $null = [System.Net.Dns]::GetHostEntry($d.s + "." + $d.t)
+                return @{subdomain = $d.s; url = $url; status = "DNS-only"}
             } catch {}
         }
         return $null
@@ -576,17 +675,17 @@ function Scan-Ports {
     } else {
         Section "PORT SCAN (35 ports, 35x concurrent, 2s timeout)"
         
-        $openResults = Invoke-Parallel -Items $Script:commonPorts -Threads 35 -LogLabel "Port Scan" -ScriptBlock {
-            param($port)
-            $h = $using:targetClean
+        $items = $Script:commonPorts | ForEach-Object { @{p=$_; h=$targetClean} }
+        $openResults = Invoke-Parallel -Items $items -Threads 35 -LogLabel "Port Scan" -ScriptBlock {
+            param($d)
             try {
                 $tcp = New-Object System.Net.Sockets.TcpClient
-                $async = $tcp.BeginConnect($h, $port, $null, $null)
+                $async = $tcp.BeginConnect($d.h, $d.p, $null, $null)
                 $wait = $async.AsyncWaitHandle.WaitOne(2000, $false)
                 if ($wait -and $tcp.Connected) {
                     $tcp.EndConnect($async) | Out-Null
                     $tcp.Close()
-                    return $port
+                    return $d.p
                 }
                 $tcp.Close()
             } catch {}
@@ -787,7 +886,7 @@ function Scan-Vulns {
     Section "VULNERABILITY CHECKS"
     $vulns = @()
     
-    # --- Known sensitive paths ---
+    # --- Known sensitive paths (concurrent) ---
     $vulnPaths = @("/.env","/wp-config.php.bak","/config.php.bak","/config.bak","/db.sql","/dump.sql","/backup.sql",
                    "/.git/config","/.svn/entries","/crossdomain.xml","/clientaccesspolicy.xml","/phpinfo.php","/info.php",
                    "/debug","/api/debug","/actuator","/actuator/health","/swagger-ui.html","/api/swagger",
@@ -801,16 +900,32 @@ function Scan-Vulns {
                    "/swagger-resources","/v2/api-docs","/v3/api-docs","/openapi.json",
                    "/_debug/","/dev/","/test/","/tests/","/staging/","/beta/")
     
-    foreach ($path in $vulnPaths) {
+    $vulnItems = $vulnPaths | ForEach-Object { @{p=$_; b=$baseUrl} }
+    $vulnResults = Invoke-Parallel -Items $vulnItems -Threads 20 -LogLabel "Vuln Path Scan" -ScriptBlock {
+        param($d)
         try {
-            $ua = $Script:userAgents | Get-Random
-            $r = Invoke-WebRequest "$baseUrl$path" -UserAgent $ua -TimeoutSec 5 -UseBasicParsing -ErrorAction Stop
-            $code = [int]$r.StatusCode
+            [System.Net.ServicePointManager]::ServerCertificateValidationCallback = {$true}
+            $wr = [System.Net.WebRequest]::Create($d.b + $d.p)
+            $wr.Method = "GET"; $wr.Timeout = 5000
+            $wr.UserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+            $resp = $null
+            try { $resp = $wr.GetResponse() } catch {
+                $ex = $_.Exception
+                if ($ex.InnerException -and $ex.InnerException.Response) { $resp = $ex.InnerException.Response }
+                elseif ($ex.Response) { $resp = $ex.Response }
+            }
+            $code = if ($resp) { [int][System.Net.HttpWebResponse]$resp.StatusCode } else { 0 }
+            if ($resp) { $resp.Close() }
             if ($code -ne 404 -and $code -ne 429 -and $code -ne 403) {
-                $vulns += "$path (HTTP $code)"
-                Log "  [VULN] $path -> HTTP $code" "Red"
+                return @{path = $d.p; code = $code}
             }
         } catch {}
+        return $null
+    }
+    
+    foreach ($vr in ($vulnResults | Where-Object { $_ })) {
+        $vulns += $vr.path + " (HTTP " + $vr.code + ")"
+        Log ("  [VULN] " + $vr.path + " -> HTTP " + $vr.code) "Red"
     }
     
     # --- HTTP check ---
@@ -1124,18 +1239,27 @@ function Scan-CORS {
     
     # Check with custom Origin header
     try {
-        $ua = $Script:userAgents | Get-Random
-        $wc = New-Object System.Net.WebClient
-        $wc.Headers.Add("User-Agent", $ua)
-        $wc.Headers.Add("Origin", "https://evil.com")
-        $data = $wc.DownloadString($baseUrl)
-        $responseHeaders = $wc.ResponseHeaders
-        if ($responseHeaders -and $responseHeaders["Access-Control-Allow-Origin"]) {
-            $acao = $responseHeaders["Access-Control-Allow-Origin"]
-            if ($acao -eq "*" -or $acao -eq "https://evil.com") {
-                $corsIssues += "CORS reflects Origin header: $acao"
-                Log "  [CORS] Reflects origin: $acao" "Red"
+        [System.Net.ServicePointManager]::ServerCertificateValidationCallback = {$true}
+        $wr = [System.Net.WebRequest]::Create($baseUrl)
+        $wr.Method = "GET"; $wr.Timeout = 8000
+        $wr.UserAgent = $Script:userAgents | Get-Random
+        $wr.Headers.Add("Origin", "https://evil.com")
+        $resp = $null
+        try { $resp = $wr.GetResponse() } catch {
+            $ex = $_.Exception
+            if ($ex.InnerException -and $ex.InnerException.Response) { $resp = $ex.InnerException.Response }
+            elseif ($ex.Response) { $resp = $ex.Response }
+        }
+        if ($resp) {
+            $webResp = [System.Net.HttpWebResponse]$resp
+            if ($webResp.Headers["Access-Control-Allow-Origin"]) {
+                $acao = $webResp.Headers["Access-Control-Allow-Origin"]
+                if ($acao -eq "*" -or $acao -eq "https://evil.com") {
+                    $corsIssues += "CORS reflects Origin header: $acao"
+                    Log "  [CORS] Reflects origin: $acao" "Red"
+                }
             }
+            $resp.Close()
         }
     } catch {}
     
@@ -1629,6 +1753,27 @@ function Generate-Report {
     $wsHtml = ""; if ($results.websocket -and $results.websocket.Count -gt 0) { $wsHtml = "<div class='section'><h2>WebSocket Endpoints</h2><ul>"; foreach ($w in $results.websocket) { $wsHtml += "<li>$w</li>" }; $wsHtml += "</ul></div>" }
     $jwtHtml = ""; if ($results.jwt -and $results.jwt.Count -gt 0) { $jwtHtml = "<div class='section'><h2>JWT Tokens Found</h2><ul>"; foreach ($t in $results.jwt) { $jwtHtml += "<li class='warn'>$($t.Substring(0, [Math]::Min(80, $t.Length)))...</li>" }; $jwtHtml += "</ul></div>" }
     
+    # Code distribution chart (from dir scan codes)
+    $codeChartHtml = ""
+    if ($results.dirs -and $results.dirs.Count -gt 0) {
+        $codeCounts = @{}
+        foreach ($d in $results.dirs) {
+            $c = $d.code.ToString()
+            if (-not $codeCounts.ContainsKey($c)) { $codeCounts[$c] = 0 }
+            $codeCounts[$c]++
+        }
+        $maxC = ($codeCounts.Values | Measure-Object -Maximum).Maximum
+        if ($maxC -gt 0) {
+            $codeChartHtml = "<div class='section'><h2>Directory HTTP Code Distribution</h2>"
+            foreach ($k in ($codeCounts.Keys | Sort-Object)) {
+                $pct = [math]::Round($codeCounts[$k] / $maxC * 100, 0)
+                $barColor = if ([int]$k -ge 200 -and [int]$k -lt 300) { "#00ff88" } elseif ([int]$k -ge 300 -and [int]$k -lt 400) { "#ffd700" } else { "#ff4444" }
+                $codeChartHtml = $codeChartHtml + "<div class='code-row'><span class='code-label'>$k</span><div class='bar-wrapper'><div class='bar' style='width:${pct}px;background:$barColor'></div></div><span class='code-count'>$($codeCounts[$k])x</span></div>"
+            }
+            $codeChartHtml = $codeChartHtml + "</div>"
+        }
+    }
+    
     $ipHtml = ""; if ($results.ip) { $ipHtml = "<tr><th>IP Address</th><td>$($results.ip -join ', ')</td></tr>" }
     $techRowHtml = ""; if ($results.tech) { $techRowHtml = "<tr><th>Tech (Headers)</th><td>$($results.tech -join ', ')</td></tr>" }
     
@@ -1652,6 +1797,13 @@ table { width:100%; border-collapse:collapse; margin:10px 0; }
 th,td { padding:8px; text-align:left; border-bottom:1px solid #2a2a3e; }
 th { background:#2a2a3e; color:#ffd700; }
 .score-box { display:inline-block; padding:10px 20px; border-radius:5px; font-size:24px; font-weight:bold; margin:10px 0; }
+.code-row { display:flex; align-items:center; margin:4px 0; gap:8px }
+.code-label { width:40px; font-size:12px; color:#94a3b8; text-align:right }
+.code-count { font-size:12px; color:#94a3b8; white-space:nowrap }
+.bar-wrapper { flex:1; height:20px; background:#2a2a3e; border-radius:4px; overflow:hidden }
+.bar { height:100%; min-width:4px; border-radius:4px; transition:width 0.2s }
+.score-bar { height:8px; background:#2a2a3e; border-radius:4px; overflow:hidden; margin:8px 0 }
+.score-fill { height:100%; border-radius:4px; transition:width 0.5s }
 .summary-grid { display:grid; grid-template-columns:1fr 1fr; gap:10px; }
 .meta { color:#888; font-size:12px; }
 </style>
@@ -1662,6 +1814,7 @@ th { background:#2a2a3e; color:#ffd700; }
 
 <div class="section">
 <h2>Summary</h2>
+<div class='score-bar'><div class='score-fill $scoreClass' style='width:$score%' title='Score: $score/100'></div></div>
 <table>
 <tr><th>Target</th><td>$targetClean</td></tr>
 $ipHtml
@@ -1671,8 +1824,15 @@ $techRowHtml
 </table>
 <div class='score-box $scoreClass'>Security Score: $score/100 ($grade)</div>
 </div>
+</table>
+<div class='score-box $scoreClass'>Security Score: $score/100 ($grade)</div>
+</div>
 
-<div class='section'><h2>Security Headers</h2>$headersHtml</div>
+<div class='section'><h2>Security Headers</h2>
+<div class='code-row'><span class='code-label'>OK</span><div class='bar-wrapper'><div class='bar' style='width:$([Math]::Min(100, $($results.headers_present).Count * 20))px;background:#00ff88'></div></div><span class='code-count'>$($results.headers_present.Count)/$($($results.headers_present).Count + $($results.headers_missing).Count) present</span></div>
+<div class='code-row'><span class='code-label'>Missing</span><div class='bar-wrapper'><div class='bar' style='width:$([Math]::Min(100, $($results.headers_missing).Count * 20))px;background:#ff4444'></div></div><span class='code-count'>$($results.headers_missing.Count)/$($($results.headers_present).Count + $($results.headers_missing).Count) missing</span></div>
+$headersHtml
+</div>
 $wafHtml
 $techHtml
 $cmsHtml
@@ -1694,6 +1854,7 @@ $wsHtml
 $jwtHtml
 $emailHtml
 $linkHtml
+$codeChartHtml
 $waybackHtml
 
 <div class='footer'>
@@ -1712,6 +1873,7 @@ $waybackHtml
 # =====================================================================
 # MAIN
 # =====================================================================
+[System.Net.ServicePointManager]::ServerCertificateValidationCallback = {$true}
 Write-Banner
 
 if (-not $Target -and -not $TargetFile) {
