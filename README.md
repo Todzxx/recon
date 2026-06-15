@@ -1,8 +1,17 @@
-# Recon Automation Tool v4.0
+# Recon Automation Tool v5.0
 
 Custom PowerShell recon scanner for security auditing.
 
 ## Features
+
+### v5.0 Improvements
+- .NET `HttpWebRequest` (replaces `Invoke-WebRequest` cmdlet) — reliable SSL, no self-signed cert issues
+- `[System.Net.ServicePointManager]::ServerCertificateValidationCallback` — universal SSL bypass
+- Fixed `$using:` bug in runspace pools — parallel directory/subdomain/port scans now work correctly
+- Concurrent vulnerability scanning — 55+ sensitive paths checked in parallel
+- Rate limiting awareness — 429 auto-detection + Retry-After header + exponential backoff
+- HTML report bar charts — HTTP code distribution, security headers score bar
+- Rate limited retry — 3 retries on failure with exponential backoff
 
 ### Core (v1-v3)
 - Security headers check (HSTS, CSP, XFO, etc.) + scoring
