@@ -14,6 +14,7 @@ import socket
 import ssl
 import hashlib
 import base64
+import subprocess
 import time
 import random
 import concurrent.futures
@@ -507,6 +508,73 @@ def scan_ports(base_url, target_clean, results, verbose=False):
         svc = PORT_SERVICE_MAP.get(p, "Unknown")
         log(f"  [OPEN] Port {p} ({svc})", Fore.RED)
     log(f"Found {len(open_ports)} open ports", Fore.CYAN)
+
+
+def scan_ports_nmap(base_url, target_clean, results, nmap_args=None, output_dir=None, verbose=False):
+    section("PORT SCAN (nmap)")
+    if nmap_args is None:
+        nmap_args = "-sV -sC --min-rate=500 --max-retries=2"
+    try:
+        subprocess.run(["nmap", "--version"], capture_output=True, check=True)
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        log("  nmap not found. Install nmap or skip --nmap.", Fore.RED)
+        return
+
+    output_dir = Path(output_dir) if output_dir else Path("./recon")
+    output_dir.mkdir(parents=True, exist_ok=True)
+    xml_file = output_dir / f"nmap_{target_clean}.xml"
+
+    cmd = f"nmap {nmap_args} -oX \"{xml_file}\" {target_clean}"
+    log(f"  Running: {cmd}", Fore.CYAN)
+    try:
+        result = subprocess.run(
+            ["nmap"] + nmap_args.split() + ["-oX", str(xml_file), target_clean],
+            capture_output=True, text=True, timeout=300
+        )
+        if result.returncode != 0:
+            log(f"  nmap failed (exit {result.returncode})", Fore.RED)
+            return
+    except subprocess.TimeoutExpired:
+        log("  nmap timed out (300s)", Fore.RED)
+        return
+    except Exception as e:
+        log(f"  nmap error: {e}", Fore.RED)
+        return
+
+    if not xml_file.exists():
+        log("  nmap XML output not found", Fore.RED)
+        return
+
+    try:
+        import xml.etree.ElementTree as ET
+        tree = ET.parse(xml_file)
+        root = tree.getroot()
+
+        open_ports = []
+        nmap_ports = []
+        for host in root.findall(".//host"):
+            for port in host.findall(".//port"):
+                state = port.find("state")
+                if state is not None and state.get("state") == "open":
+                    pnum = int(port.get("portid"))
+                    svc_el = port.find("service")
+                    svc = svc_el.get("name", "unknown") if svc_el is not None else "unknown"
+                    product = svc_el.get("product", "") if svc_el is not None else ""
+                    version = svc_el.get("version", "") if svc_el is not None else ""
+
+                    info = f"{pnum} ({svc}"
+                    if product:
+                        info += f" - {product} {version}"
+                    info += ")"
+                    log(f"  [OPEN] {info}", Fore.RED)
+                    open_ports.append(pnum)
+                    nmap_ports.append(info)
+
+        results["ports"] = open_ports
+        results["nmap_ports"] = nmap_ports
+        log(f"nmap found {len(open_ports)} open ports with service detection", Fore.CYAN)
+    except Exception as e:
+        log(f"  Failed to parse nmap XML: {e}", Fore.RED)
 
 
 # =====================================================================
@@ -1467,6 +1535,7 @@ def export_json(base_url, target_clean, results, output_dir, verbose=False):
         "dirs": results.get("dirs"),
         "subdomains": results.get("subdomains"),
         "ports": results.get("ports"),
+        "nmap_ports": results.get("nmap_ports"),
         "dns": results.get("dns"),
         "ssl": results.get("ssl"),
         "ssl_days_left": results.get("ssl_days_left"),
@@ -1604,7 +1673,10 @@ def generate_report(base_url, target_clean, results, output_dir, verbose=False):
     dns_html = _build_kv_section("DNS Records", results.get("dns"))
     dirs_html = _build_section("Discovered Paths", [f"[{d['code']}] {d['path']}" for d in (results.get("dirs") or [])], "warn")
     sub_html = _build_section("Subdomains", [f"{s['url']} ({s['status']})" for s in (results.get("subdomains") or [])], "info")
-    port_html = _build_section("Open Ports", [f"Port {p} ({PORT_SERVICE_MAP.get(p, 'Unknown')})" for p in (results.get("ports") or [])], "warn")
+    if results.get("nmap_ports"):
+        port_html = _build_section("Open Ports (nmap)", results.get("nmap_ports"), "warn")
+    else:
+        port_html = _build_section("Open Ports", [f"Port {p} ({PORT_SERVICE_MAP.get(p, 'Unknown')})" for p in (results.get("ports") or [])], "warn")
     vuln_html = _build_section("Vulnerabilities Found", results.get("vulns"), "bad", "No vulnerabilities detected in basic scan")
     email_html = _build_section("Emails Found", results.get("emails"))
     api_html = _build_section("API / GraphQL", results.get("api_fuzz"), "warn")
@@ -1719,6 +1791,7 @@ Examples:
   python recon.py -t example.com
   python recon.py -t example.com --full --verbose
   python recon.py -t example.com --full --json --wordlist mydirs.txt --depth 2
+  python recon.py -t example.com --full --nmap --nmap-args "-sV -sC --top-ports 100"
   python recon.py -T targets.txt
         """
     )
@@ -1729,6 +1802,8 @@ Examples:
     parser.add_argument("-o", "--output", default="./recon", help="Output directory for reports (default: ./recon)")
     parser.add_argument("-w", "--wordlist", help="Custom wordlist file for directory scan")
     parser.add_argument("-d", "--depth", type=int, default=1, help="Directory recursion depth (default: 1, max: 3)")
+    parser.add_argument("--nmap", action="store_true", help="Use nmap for port scanning (requires nmap installed)")
+    parser.add_argument("--nmap-args", default="-sV -sC --min-rate=500 --max-retries=2", help="Extra nmap arguments (default: -sV -sC --min-rate=500 --max-retries=2)")
     parser.add_argument("-v", "--verbose", action="store_true", help="Enable verbose/debug output")
 
     args = parser.parse_args()
@@ -1812,7 +1887,10 @@ Examples:
         scan_jwt(base_url, clean_t, results, verbose=args.verbose)
 
         if args.full:
-            scan_ports(base_url, clean_t, results, verbose=args.verbose)
+            if args.nmap:
+                scan_ports_nmap(base_url, clean_t, results, nmap_args=args.nmap_args, output_dir=output_dir, verbose=args.verbose)
+            else:
+                scan_ports(base_url, clean_t, results, verbose=args.verbose)
             scan_subdomains(base_url, clean_t, results, verbose=args.verbose)
 
         update_score(results)

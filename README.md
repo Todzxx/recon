@@ -37,6 +37,7 @@ Multi-module recon scanner di-Python-kan dari versi PowerShell asli.
 python recon.py -t example.com
 python recon.py -t example.com --full --verbose
 python recon.py -t example.com --full --json --wordlist mydirs.txt --depth 2
+python recon.py -t example.com --full --nmap --nmap-args "-sV -sC --top-ports 100"
 python recon.py -T targets.txt
 ```
 
@@ -51,6 +52,8 @@ python recon.py -T targets.txt
 | `-o, --output` | Output directory (default: `./recon`) |
 | `-w, --wordlist` | Custom directory wordlist file |
 | `-d, --depth` | Directory recursion depth (1-3, default: 1) |
+| `--nmap` | Use nmap for port scanning (requires nmap installed) |
+| `--nmap-args` | Extra nmap arguments (default: `-sV -sC --min-rate=500 --max-retries=2`) |
 | `-v, --verbose` | Enable debug output |
 
 ## Requirements
