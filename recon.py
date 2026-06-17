@@ -218,6 +218,19 @@ def request_safe(url, method="GET", timeout=15, body=None, content_type=None, he
                 method, url, headers=req_headers, data=body,
                 timeout=timeout, allow_redirects=True
             )
+
+            if resp.status_code == 429:
+                wait = 30
+                if "Retry-After" in resp.headers:
+                    try:
+                        wait = int(resp.headers["Retry-After"])
+                    except ValueError:
+                        pass
+                wait = min(wait, 60)
+                debug_msg(f"429 rate limited, waiting {wait}s (attempt {attempt+1}/{max_retries})", verbose)
+                if attempt < max_retries - 1:
+                    time.sleep(wait)
+                    continue
             return resp
         except requests.exceptions.RequestException as e:
             if attempt < max_retries - 1:
@@ -234,15 +247,6 @@ def request_method(url, method, timeout=8):
         req_headers = {"User-Agent": get_random_ua()}
         resp = session.request(method, url, headers=req_headers, timeout=timeout, allow_redirects=True)
         return {"status": resp.status_code, "len": len(resp.text)}
-    except requests.exceptions.RequestException:
-        return None
-
-
-def request_quick(url, timeout=8):
-    try:
-        req_headers = {"User-Agent": get_random_ua()}
-        resp = session.get(url, headers=req_headers, timeout=timeout, allow_redirects=True)
-        return resp
     except requests.exceptions.RequestException:
         return None
 
@@ -590,13 +594,21 @@ def scan_ssl(base_url, target_clean, results, verbose=False):
         }
 
         try:
-            exp_date = datetime.strptime(valid_to, "%b %d %H:%M:%S %Y %Z")
-            days_left = (exp_date - datetime.now()).days
-            if days_left < 30:
-                log(f"  [WARN] Certificate expires in {days_left} days!", Fore.RED)
-            else:
-                log(f"  Certificate expires in {days_left} days", Fore.GREEN)
-            results["ssl_days_left"] = days_left
+            valid_to_clean = valid_to.replace(" GMT", "").strip()
+            exp_date = None
+            for fmt in ["%b %d %H:%M:%S %Y", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S", "%m/%d/%Y %H:%M:%S"]:
+                try:
+                    exp_date = datetime.strptime(valid_to_clean, fmt)
+                    break
+                except ValueError:
+                    continue
+            if exp_date:
+                days_left = (exp_date - datetime.now()).days
+                if days_left < 30:
+                    log(f"  [WARN] Certificate expires in {days_left} days!", Fore.RED)
+                else:
+                    log(f"  Certificate expires in {days_left} days", Fore.GREEN)
+                results["ssl_days_left"] = days_left
         except Exception:
             pass
 
@@ -653,8 +665,6 @@ def scan_tech_fingerprint(base_url, target_clean, results, verbose=False):
         techs.append("Joomla")
     if re.search(r'__INITIAL_STATE__|__NEXT_DATA__|_app\.jsx', content, re.I):
         techs.append("React/Next.js")
-    if re.search(r'x-powered-by', content, re.I):
-        pass
     if resp.headers.get("X-Powered-By"):
         techs.append(f"Powered-By:{resp.headers['X-Powered-By']}")
     if resp.headers.get("Server"):
@@ -1341,7 +1351,7 @@ def scan_jwt(base_url, target_clean, results, verbose=False):
             log("  [JWT] Token found in cookie", Fore.YELLOW)
 
     if resp.text:
-        jwt_pattern = re.compile(r'eyJ[a-zA-Z0-9_-]{10,}\.[a-zA-Z0-9_-]{10,}\.[a-zA-Z0-9_-]{10,}')
+        jwt_pattern = re.compile(r'eyJ[a-zA-Z0-9_-]+=*\.[a-zA-Z0-9_-]+=*\.[a-zA-Z0-9_-]+=*')
         for m in jwt_pattern.finditer(resp.text):
             token = m.group(0)
             if token not in jwts:
@@ -1501,6 +1511,40 @@ def grade_from_score(score):
 # HTML REPORT
 # =====================================================================
 
+def _build_section(title, items, css_class="", empty_msg=""):
+    if not items:
+        if empty_msg:
+            return f"<div class='section'><h2>{title}</h2><p class='good'>{empty_msg}</p></div>"
+        return ""
+    html = f"<div class='section'><h2>{title}</h2><ul>"
+    for item in items:
+        cls = f" class='{css_class}'" if css_class else ""
+        html += f"<li{cls}>{item}</li>"
+    html += "</ul></div>"
+    return html
+
+
+def _build_kv_section(title, data, key_label="", val_label=""):
+    if not data:
+        return ""
+    html = f"<div class='section'><h2>{title}</h2><ul>"
+    for k, vals in data.items():
+        for v in (vals if isinstance(vals, list) else [vals]):
+            html += f"<li><b>{k}</b>: {v}</li>"
+    html += "</ul></div>"
+    return html
+
+
+def _build_link_section(title, items):
+    if not items:
+        return ""
+    html = f"<div class='section'><h2>{title}</h2><ul>"
+    for l in items:
+        html += f"<li><a href='{l}' style='color:#8888ff'>{l}</a></li>"
+    html += "</ul></div>"
+    return html
+
+
 def generate_report(base_url, target_clean, results, output_dir, verbose=False):
     section("REPORT GENERATION")
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -1519,35 +1563,6 @@ def generate_report(base_url, target_clean, results, output_dir, verbose=False):
             headers_html += f"<li class='bad'>[MISSING] {h}</li>"
     headers_html += "</ul>"
 
-    waf_html = ""
-    if results.get("waf"):
-        waf_html = "<div class='section'><h2>WAF Detection</h2><ul>"
-        for w in results["waf"]:
-            waf_html += f"<li class='info'>{w}</li>"
-        waf_html += "</ul></div>"
-
-    tech_html = ""
-    if results.get("tech_fp"):
-        tech_html = "<div class='section'><h2>Technology Stack</h2><ul>"
-        for t in results["tech_fp"]:
-            tech_html += f"<li>{t}</li>"
-        tech_html += "</ul></div>"
-
-    cms_html = ""
-    if results.get("cms"):
-        cms_html = "<div class='section'><h2>CMS Detection</h2><ul>"
-        for c in results["cms"]:
-            cms_html += f"<li>{c}</li>"
-        cms_html += "</ul></div>"
-
-    dns_html = ""
-    if results.get("dns"):
-        dns_html = "<div class='section'><h2>DNS Records</h2><ul>"
-        for k, v in results["dns"].items():
-            for val in (v if isinstance(v, list) else [v]):
-                dns_html += f"<li><b>{k}</b>: {val}</li>"
-        dns_html += "</ul></div>"
-
     ssl_html = ""
     if results.get("ssl"):
         s = results["ssl"]
@@ -1559,125 +1574,10 @@ def generate_report(base_url, target_clean, results, output_dir, verbose=False):
 <li>Expires in: {results.get('ssl_days_left', 'N/A')} days</li>
 </ul></div>"""
 
-    dirs_html = ""
-    if results.get("dirs"):
-        dirs_html = f"<div class='section'><h2>Discovered Paths ({len(results['dirs'])})</h2><ul>"
-        for d in results["dirs"]:
-            dirs_html += f"<li class='warn'>[{d['code']}] {d['path']}</li>"
-        dirs_html += "</ul></div>"
-
-    sub_html = ""
-    if results.get("subdomains"):
-        sub_html = f"<div class='section'><h2>Subdomains ({len(results['subdomains'])})</h2><ul>"
-        for s in results["subdomains"]:
-            sub_html += f"<li class='info'>{s['url']} ({s['status']})</li>"
-        sub_html += "</ul></div>"
-
-    port_html = ""
-    if results.get("ports"):
-        port_html = f"<div class='section'><h2>Open Ports ({len(results['ports'])})</h2><ul>"
-        for p in results["ports"]:
-            svc = PORT_SERVICE_MAP.get(p, "Unknown")
-            port_html += f"<li class='warn'>Port {p} ({svc})</li>"
-        port_html += "</ul></div>"
-
-    vuln_html = ""
-    if results.get("vulns"):
-        vuln_html = f"<div class='section'><h2>Vulnerabilities Found ({len(results['vulns'])})</h2><ul>"
-        for v in results["vulns"]:
-            vuln_html += f"<li class='bad'>{v}</li>"
-        vuln_html += "</ul></div>"
-    else:
-        vuln_html = "<div class='section'><h2>Vulnerabilities</h2><p class='good'>No vulnerabilities detected in basic scan</p></div>"
-
-    email_html = ""
-    if results.get("emails"):
-        email_html = f"<div class='section'><h2>Emails Found</h2><ul>"
-        for e in results["emails"]:
-            email_html += f"<li>{e}</li>"
-        email_html += "</ul></div>"
-
-    link_html = ""
-    if results.get("internal_links"):
-        link_html = f"<div class='section'><h2>Internal Links</h2><ul>"
-        for l in results["internal_links"]:
-            link_html += f"<li><a href='{l}' style='color:#8888ff'>{l}</a></li>"
-        link_html += "</ul></div>"
-
-    api_html = ""
-    if results.get("api_fuzz"):
-        api_html = f"<div class='section'><h2>API / GraphQL</h2><ul>"
-        for a in results["api_fuzz"]:
-            api_html += f"<li class='warn'>{a}</li>"
-        api_html += "</ul></div>"
-
-    wayback_html = ""
-    if results.get("wayback"):
-        wayback_html = f"<div class='section'><h2>Wayback Machine (last 20)</h2><ul>"
-        for w in results["wayback"]:
-            wayback_html += f"<li>{w['date']} [{w['status']}] <a href='{w['url']}' style='color:#8888ff'>{w['url']}</a></li>"
-        wayback_html += "</ul></div>"
-
-    js_html = ""
-    if results.get("js_endpoints"):
-        js_html = f"<div class='section'><h2>JS Endpoints ({len(results['js_endpoints'])})</h2><ul>"
-        for ep in results["js_endpoints"]:
-            js_html += f"<li>{ep}</li>"
-        js_html += "</ul></div>"
-
-    key_html = ""
-    if results.get("api_keys"):
-        key_html = f"<div class='section'><h2>API Keys / Secrets Found!</h2><ul>"
-        for k in results["api_keys"]:
-            key_html += f"<li class='bad'>{k}</li>"
-        key_html += "</ul></div>"
-
-    cors_html = ""
-    if results.get("cors"):
-        cors_html = f"<div class='section'><h2>CORS Issues</h2><ul>"
-        for c in results["cors"]:
-            cors_html += f"<li class='bad'>{c}</li>"
-        cors_html += "</ul></div>"
-
-    cdn_html = ""
-    if results.get("cdn_bypass"):
-        cdn_html = f"<div class='section'><h2>Origin IP (CDN Bypass)</h2><ul>"
-        for c in results["cdn_bypass"]:
-            cdn_html += f"<li class='warn'>{c}</li>"
-        cdn_html += "</ul></div>"
-
-    method_html = ""
-    if results.get("method_fuzz"):
-        method_html = f"<div class='section'><h2>HTTP Method Fuzzing</h2><ul>"
-        for m in results["method_fuzz"]:
-            method_html += f"<li class='warn'>{m}</li>"
-        method_html += "</ul></div>"
-
     favicon_html = ""
     if results.get("favicon"):
         f = results["favicon"]
         favicon_html = f"<div class='section'><h2>Favicon</h2><ul><li>Path: {f.get('path', 'N/A')}</li><li>MD5: {f.get('md5', 'N/A')}</li><li>Match: {f.get('tech', 'N/A')}</li></ul></div>"
-
-    bucket_html = ""
-    if results.get("cloud_buckets"):
-        bucket_html = f"<div class='section'><h2>Cloud Buckets</h2><ul>"
-        for b in results["cloud_buckets"]:
-            bucket_html += f"<li class='bad'>{b}</li>"
-        bucket_html += "</ul></div>"
-
-    ws_html = ""
-    if results.get("websocket"):
-        ws_html = f"<div class='section'><h2>WebSocket Endpoints</h2><ul>"
-        for w in results["websocket"]:
-            ws_html += f"<li>{w}</li>"
-        ws_html += "</ul></div>"
-
-    jwt_html = ""
-    if results.get("jwt"):
-        jwt_html = f"<div class='section'><h2>JWT Tokens Found</h2><ul>"
-        for t in results["jwt"]:
-            jwt_html += f"<li class='warn'>{t[:80]}...</li>"
-        jwt_html += "</ul></div>"
 
     code_chart_html = ""
     if results.get("dirs"):
@@ -1700,6 +1600,27 @@ def generate_report(base_url, target_clean, results, output_dir, verbose=False):
     tech_row_html = ""
     if results.get("tech"):
         tech_row_html = f"<tr><th>Tech (Headers)</th><td>{', '.join(results['tech'])}</td></tr>"
+
+    waf_html = _build_section("WAF Detection", results.get("waf"), "info")
+    tech_html = _build_section("Technology Stack", results.get("tech_fp"))
+    cms_html = _build_section("CMS Detection", results.get("cms"))
+    dns_html = _build_kv_section("DNS Records", results.get("dns"))
+    dirs_html = _build_section("Discovered Paths", [f"[{d['code']}] {d['path']}" for d in (results.get("dirs") or [])], "warn")
+    sub_html = _build_section("Subdomains", [f"{s['url']} ({s['status']})" for s in (results.get("subdomains") or [])], "info")
+    port_html = _build_section("Open Ports", [f"Port {p} ({PORT_SERVICE_MAP.get(p, 'Unknown')})" for p in (results.get("ports") or [])], "warn")
+    vuln_html = _build_section("Vulnerabilities Found", results.get("vulns"), "bad", "No vulnerabilities detected in basic scan")
+    email_html = _build_section("Emails Found", results.get("emails"))
+    api_html = _build_section("API / GraphQL", results.get("api_fuzz"), "warn")
+    js_html = _build_section("JS Endpoints", results.get("js_endpoints"))
+    key_html = _build_section("API Keys / Secrets Found!", results.get("api_keys"), "bad")
+    cors_html = _build_section("CORS Issues", results.get("cors"), "bad")
+    cdn_html = _build_section("Origin IP (CDN Bypass)", results.get("cdn_bypass"), "warn")
+    method_html = _build_section("HTTP Method Fuzzing", results.get("method_fuzz"), "warn")
+    bucket_html = _build_section("Cloud Buckets", results.get("cloud_buckets"), "bad")
+    ws_html = _build_section("WebSocket Endpoints", results.get("websocket"))
+    jwt_html = _build_section("JWT Tokens Found", [f"{t[:80]}..." for t in (results.get("jwt") or [])], "warn")
+    wayback_html = _build_section("Wayback Machine (last 20)", [f"{w['date']} [{w['status']}] {w['url']}" for w in (results.get("wayback") or [])])
+    link_html = _build_link_section("Internal Links", results.get("internal_links"))
 
     html = f"""<!DOCTYPE html>
 <html lang="en">
@@ -1808,7 +1729,7 @@ Examples:
     parser.add_argument("-T", "--target-file", help="File containing list of targets (one per line)")
     parser.add_argument("--full", action="store_true", help="Full scan (+ ports, subdomains)")
     parser.add_argument("--json", action="store_true", help="Export results as JSON")
-    parser.add_argument("-o", "--output", default="D:\\TUGAS\\output\\recon", help="Output directory for reports")
+    parser.add_argument("-o", "--output", default="./recon", help="Output directory for reports (default: ./recon)")
     parser.add_argument("-w", "--wordlist", help="Custom wordlist file for directory scan")
     parser.add_argument("-d", "--depth", type=int, default=1, help="Directory recursion depth (default: 1, max: 3)")
     parser.add_argument("-v", "--verbose", action="store_true", help="Enable verbose/debug output")
