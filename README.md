@@ -48,7 +48,7 @@ python recon.py -T targets.txt
 | `-T, --target-file` | File containing list of targets |
 | `--full` | Full scan (+ ports, subdomains) |
 | `--json` | Export results as JSON |
-| `-o, --output` | Output directory (default: `D:\TUGAS\output\recon`) |
+| `-o, --output` | Output directory (default: `./recon`) |
 | `-w, --wordlist` | Custom directory wordlist file |
 | `-d, --depth` | Directory recursion depth (1-3, default: 1) |
 | `-v, --verbose` | Enable debug output |

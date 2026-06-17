@@ -14,14 +14,12 @@ import socket
 import ssl
 import hashlib
 import base64
-import struct
 import time
 import random
 import concurrent.futures
-import ipaddress
 from datetime import datetime
-from urllib.parse import urlparse, urljoin
 from pathlib import Path
+from urllib.parse import quote
 
 import requests
 import dns.resolver
@@ -813,7 +811,6 @@ def scan_vulns(base_url, target_clean, results, verbose=False):
     sqli_payloads = ["'", "\"", "1' OR 1=1", "1\" OR \"1\"=\"1", "' OR 1=1--", "admin'--"]
     for payload in sqli_payloads:
         try:
-            from urllib.parse import quote
             url = f"{base_url}/api?q={quote(payload)}"
             r = request_safe(url, timeout=5, verbose=verbose)
             if r and re.search(r'sql|syntax|mysql|oracle|postgres|odbc|db2|sqlite|driver|unclosed|quoted', r.text, re.I):
